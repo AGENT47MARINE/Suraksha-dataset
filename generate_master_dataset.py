@@ -3,6 +3,7 @@ import os
 import random
 import string
 import hashlib
+import re
 from datetime import datetime, timedelta
 
 # Output directory
@@ -440,6 +441,24 @@ def generate_row(app_id, label, fraud_sub_type, clean_calibrator=0.0, fraud_cali
         
     row['borrower_name'] = get_indian_name(state)
     
+    # 1. Identity & KYC Details (Populated for All Records)
+    last_name = row['borrower_name'].split()[-1] if len(row['borrower_name'].split()) > 1 else "Kumar"
+    fifth_char = last_name[0].upper() if last_name else 'P'
+    pan_prefix = ''.join(random.choices(string.ascii_uppercase, k=3)) + 'P' + fifth_char
+    pan_digits = ''.join(random.choices(string.digits, k=4))
+    pan_suffix = random.choice(string.ascii_uppercase)
+    row['borrower_pan'] = f"{pan_prefix}{pan_digits}{pan_suffix}"
+    
+    if fraud_sub_type == "Identity_Document_Fraud" and random.random() < 0.50:
+        bad_fifth = random.choice([c for c in string.ascii_uppercase if c != fifth_char])
+        row['borrower_pan'] = f"{pan_prefix[:4]}{bad_fifth}{pan_digits}{pan_suffix}"
+
+    row['borrower_aadhaar_no'] = f"XXXX-XXXX-{''.join(random.choices(string.digits, k=4))}"
+    row['identity_document_type'] = random.choices(
+        ["Aadhaar", "PAN_Card", "Passport", "Voter_ID"],
+        weights=[55, 25, 10, 10]
+    )[0]
+    
     # Income baseline
     if loan_type == "Agricultural":
         declared_inc = int(row['loan_amount_inr'] / random.uniform(1.0, 3.0))
@@ -458,9 +477,29 @@ def generate_row(app_id, label, fraud_sub_type, clean_calibrator=0.0, fraud_cali
     if is_agri_emp:
         row['itr_declared_income'] = None
         row['itr_acknowledgement_no'] = None
+        row['itr_filing_date'] = None
     else:
         row['itr_declared_income'] = max(170000, min(8800000, int(row['declared_income_annual_inr'] * random.uniform(0.95, 1.05))))
         row['itr_acknowledgement_no'] = generate_ack()
+        
+        # 5. ITR filing date generation
+        sub_dt = datetime.strptime(row['submission_date'], "%d-%m-%Y")
+        if label == 0:
+            filing_delay = random.randint(10, 200)
+            filing_dt = sub_dt - timedelta(days=filing_delay)
+            row['itr_filing_date'] = filing_dt.strftime("%d-%m-%Y")
+        else:
+            if fraud_sub_type in ("ITR_Income_Inflation", "Balance_Sheet_Fabrication") and random.random() < 0.60:
+                if random.random() < 0.50:
+                    filing_delay = random.randint(1, 45)
+                    filing_dt = sub_dt + timedelta(days=filing_delay)
+                    row['itr_filing_date'] = filing_dt.strftime("%d-%m-%Y")
+                else:
+                    row['itr_filing_date'] = None
+            else:
+                filing_delay = random.randint(10, 200)
+                filing_dt = sub_dt - timedelta(days=filing_delay)
+                row['itr_filing_date'] = filing_dt.strftime("%d-%m-%Y")
         
     if is_salaried_emp:
         row['form_16_gross_salary'] = int(row['declared_income_annual_inr'] * random.uniform(0.98, 1.02))
@@ -492,13 +531,44 @@ def generate_row(app_id, label, fraud_sub_type, clean_calibrator=0.0, fraud_cali
     if is_business_emp:
         gst_turn = int(row['declared_income_annual_inr'] * random.uniform(1.5, 3.0))
         row['gst_annual_turnover'] = max(435000, min(29400000, gst_turn))
-        pan = ''.join(random.choices(string.ascii_uppercase, k=5)) + ''.join(random.choices(string.digits, k=4)) + random.choice(string.ascii_uppercase)
-        row['gst_registration_number'] = generate_gstin(state_metadata[state]["code"], pan)
+        row['gst_registration_number'] = generate_gstin(state_metadata[state]["code"], row['borrower_pan'])
         row['gst_cross_month_inconsistency'] = False
     else:
         row['gst_annual_turnover'] = None
         row['gst_registration_number'] = None
         row['gst_cross_month_inconsistency'] = None
+        
+    # 3. Audited Financial Statements (Populated for self-employed/MSME)
+    if is_business_emp or loan_type == "MSME":
+        assets = int(row['declared_income_annual_inr'] * random.uniform(1.8, 4.5))
+        assets = (assets // 1000) * 1000
+        row['balance_sheet_total_assets'] = assets
+        
+        if label == 0 or fraud_sub_type != "Balance_Sheet_Fabrication":
+            row['balance_sheet_total_liabilities'] = assets
+        else:
+            deviation_pct = random.uniform(0.02, 0.08) * random.choice([-1, 1])
+            liab = int(assets * (1 + deviation_pct))
+            row['balance_sheet_total_liabilities'] = (liab // 1000) * 1000
+            if row['balance_sheet_total_liabilities'] == row['balance_sheet_total_assets']:
+                row['balance_sheet_total_liabilities'] += 1000
+                
+        row['pnl_net_profit_inr'] = int(row['declared_income_annual_inr'] * random.uniform(0.75, 1.15))
+        row['pnl_net_profit_inr'] = (row['pnl_net_profit_inr'] // 1000) * 1000
+        
+        ca_mem_no = f"{random.randint(100000, 999999)}"
+        ca_random = ''.join(random.choices(string.digits, k=10))
+        row['balance_sheet_auditor_urn'] = f"26{ca_mem_no}{ca_random}"
+        if fraud_sub_type == "Balance_Sheet_Fabrication" and random.random() < 0.40:
+            if random.random() < 0.50:
+                row['balance_sheet_auditor_urn'] = "INVALID_UDIN_123"
+            else:
+                row['balance_sheet_auditor_urn'] = None
+    else:
+        row['balance_sheet_total_assets'] = None
+        row['balance_sheet_total_liabilities'] = None
+        row['pnl_net_profit_inr'] = None
+        row['balance_sheet_auditor_urn'] = None
         
     if loan_type == "Agricultural" or (loan_type == "MSME" and random.random() < 0.40):
         row['nach_mandate_beneficiary_name'] = None
@@ -876,6 +946,29 @@ def generate_row(app_id, label, fraud_sub_type, clean_calibrator=0.0, fraud_cali
             
     row['processing_time_ms'] = processing_time(row['fraud_risk_category'])
     
+    # 4. Field Investigation (FI) Integration (Populated for secured/large MSME loans)
+    has_fi = loan_type in ("Housing_Finance", "Agricultural") or (loan_type == "MSME" and row['loan_amount_inr'] > 15000000)
+    if has_fi:
+        fi_status = "Passed"
+        gps_mismatch = False
+        
+        if label == 1:
+            collateral_frauds = (
+                "Survey_Number_Substitution", "Double_Pledging", "Cultivator_Name_Substitution",
+                "Property_Valuation_Inflation", "Encumbrance_Suppression", "Ownership_Chain_Manipulation"
+            )
+            if fraud_sub_type in collateral_frauds:
+                if random.random() < 0.70:
+                    fi_status = "Failed"
+                if fraud_sub_type == "Survey_Number_Substitution":
+                    gps_mismatch = True
+                    
+        row['field_investigation_status'] = fi_status
+        row['field_investigation_gps_mismatch'] = gps_mismatch
+    else:
+        row['field_investigation_status'] = "Not_Applicable"
+        row['field_investigation_gps_mismatch'] = None
+        
     # Narrative and compliance
     row['adverse_action_reason'] = format_adverse_reason(row)
     row['rbi_fpc_compliant'] = (row['adverse_action_reason'] is not None) and (row['adverse_action_triggered'])
@@ -993,10 +1086,13 @@ def generate_dataset_file(filename, total_rows, target_fraud, year_counters=None
         "employment_type", "application_channel", "document_bundle_size", "cibil_score", "loan_amount_inr",
         "land_record_document_type", "land_record_state", "land_record_survey_no", "land_record_owner_name",
         "sale_deed_consideration_value", "ec_registered_value", "ec_liens_count", "mutation_date_manipulated",
-        "borrower_name", "declared_income_annual_inr", "itr_declared_income", "itr_acknowledgement_no",
+        "borrower_name", "declared_income_annual_inr",
+        "borrower_pan", "borrower_aadhaar_no", "identity_document_type",
+        "itr_declared_income", "itr_acknowledgement_no", "itr_filing_date",
         "form_16_gross_salary", "form_16_employer_tan", "salary_slip_gross_monthly_inr", "salary_slip_employer_name",
         "salary_slip_employer_tan", "bank_statement_annual_credits_inr", "bank_statement_unusual_credits_count",
         "bank_statement_round_number_flag", "gst_annual_turnover", "gst_registration_number", "gst_cross_month_inconsistency",
+        "balance_sheet_total_assets", "balance_sheet_total_liabilities", "pnl_net_profit_inr", "balance_sheet_auditor_urn",
         "nach_mandate_beneficiary_name", "nach_mandate_amount_inr", "nach_mandate_alteration_detected", "guarantor_name",
         "guarantor_overcommitment_detected", "pdf_structural_anomaly_score", "pixel_manipulation_detected",
         "cloned_region_detected", "frequency_domain_anomaly_score", "font_inconsistency_score",
@@ -1004,7 +1100,9 @@ def generate_dataset_file(filename, total_rows, target_fraud, year_counters=None
         "ai_generated_document_probability", "compression_anomaly_detected", "documents_flagged_count",
         "pdf_metadata_modification_delay_days", "income_cross_doc_variance_pct", "itr_vs_bank_stmt_discrepancy_pct",
         "form16_vs_salary_slip_discrepancy_pct", "property_valuation_discrepancy_pct", "encumbrance_suppression_flag",
-        "double_pledge_risk_score", "employment_tan_mismatch", "overall_fraud_risk_score", "fraud_risk_category",
+        "double_pledge_risk_score", "employment_tan_mismatch", 
+        "field_investigation_status", "field_investigation_gps_mismatch",
+        "overall_fraud_risk_score", "fraud_risk_category",
         "manual_review_triggered", "adverse_action_triggered", "final_decision", "processing_time_ms",
         "ground_truth_fraud_label", "fraud_sub_type", "document_primary_language", "adverse_action_reason",
         "rbi_fpc_compliant", "audit_log_hash"
@@ -1084,6 +1182,28 @@ def run_validations(records, split_name=""):
         # 9. mutation_date_manipulated is null for all rows with null land_record_document_type
         if r['land_record_document_type'] is None:
             assert r['mutation_date_manipulated'] is None, f"mutation_date_manipulated not null for null land record"
+
+        # 10. Expanded schema assertions (KYC, Financials, FI, ITR)
+        assert re.match(r"^[A-Z]{5}\d{4}[A-Z]$", r['borrower_pan']), f"Invalid PAN format: {r['borrower_pan']}"
+        assert r['borrower_pan'][3] == 'P', f"PAN individual character not 'P': {r['borrower_pan']}"
+        assert re.match(r"^XXXX-XXXX-\d{4}$", r['borrower_aadhaar_no']), f"Invalid Aadhaar format: {r['borrower_aadhaar_no']}"
+        assert r['identity_document_type'] in ("Aadhaar", "PAN_Card", "Passport", "Voter_ID")
+        
+        if r['balance_sheet_total_assets'] is not None:
+            assert r['balance_sheet_total_liabilities'] is not None
+            assert r['pnl_net_profit_inr'] is not None
+            if r['ground_truth_fraud_label'] == 0 or r['fraud_sub_type'] != "Balance_Sheet_Fabrication":
+                assert r['balance_sheet_total_assets'] == r['balance_sheet_total_liabilities'], f"Balance sheet imbalance in clean/non-fabricated row: {r['balance_sheet_total_assets']} vs {r['balance_sheet_total_liabilities']}"
+            else:
+                assert r['balance_sheet_total_assets'] != r['balance_sheet_total_liabilities'], f"Balance sheet matches in fabricated row!"
+                
+        if r['field_investigation_gps_mismatch'] is True:
+            assert r['fraud_sub_type'] == "Survey_Number_Substitution", f"GPS mismatch in non-substitution row: {r['fraud_sub_type']}"
+            
+        if r['itr_filing_date'] is not None:
+            filing_dt = datetime.strptime(r['itr_filing_date'], "%d-%m-%Y")
+            if r['ground_truth_fraud_label'] == 0:
+                assert filing_dt <= dt, f"ITR filing date {r['itr_filing_date']} after submission date {r['submission_date']}"
 
         # Label consistency checks
         if r['ground_truth_fraud_label'] == 0:
